@@ -69,10 +69,4 @@ Contribuições são bem-vindas! Para contribuir:
    ```
 5. Abra um **Pull Request**.
 
-## 📜 Licença
-Este projeto está sob a licença MIT. Sinta-se livre para usá-lo e modificá-lo!
-
----
-Desenvolvido por [Seu Nome](https://github.com/seu-usuario) 💻🚀
-
 
