@@ -2,195 +2,220 @@ using System;
 using System.Text;
 using System.Threading.Tasks;
 using Azure.Messaging.ServiceBus;
+using dotenv.net;
+using System.IO;
 
-class Program
+internal class Program
 {
-    static string connectionString = "Endpoint";//colocar o endereço do endpoint da fila do servicebus
-    static string queueName = "casa14.queue";
-    static string playerId;
+    private static string? connectionString;
+    private static string? queueName;
+    private static string playerId;
+    private static bool minhaVez;
+    private static string[,] board = new string[5, 5];
+    private static bool gameOver = false;
 
-    static string[,] boardPlayer1 = new string[5, 5];
-    static string[,] boardPlayer2 = new string[5, 5];
+    private static string? player1Id = null;
+    private static string? player2Id = null;
+    private static string filePath = "gameState.txt"; // Caminho para o arquivo que armazena o estado do jogo
 
-    static async Task Main()
+    private static async Task Main()
     {
-        Console.WriteLine("Digite seu ID de jogador (ex: Player1 ou Player2): ");
-        playerId = Console.ReadLine();
+        DotEnv.Load();
+        connectionString = Environment.GetEnvironmentVariable("SERVICE_BUS_CONNECTION_STRING");
+        queueName = Environment.GetEnvironmentVariable("QUEUE_NAME");
 
-        // Inicializa os tabuleiros com água
-        InicializarTabuleiro(boardPlayer1);
-        InicializarTabuleiro(boardPlayer2);
-
-        // Posicionamento dos barcos
-        if (playerId == "Player1")
+        // Verificar se o arquivo de estado existe para determinar quem é Player 1 e Player 2
+        if (!File.Exists(filePath))
         {
-            Console.WriteLine("Player 1, posicione seus barcos!");
-            PosicionarBarcos(boardPlayer1);
-            MostrarTabuleiro(boardPlayer1, "Tabuleiro do Player 1");
-            Console.WriteLine("Agora é a vez do Player 2!");
-            Console.ReadLine(); // Aguardar Player 2 posicionar seus barcos
+            // Se o arquivo não existir, Player 1 será atribuído
+            player1Id = "Player1";
+            playerId = "Player1"; // O primeiro jogador a se conectar será Player1
+            File.WriteAllText(filePath, playerId); // Salvar estado no arquivo
+            Console.WriteLine("Você é o Player 1");
         }
-        else if (playerId == "Player2")
+        else
         {
-            Console.WriteLine("Aguardando o Player 1 posicionar seus barcos...");
-            Console.ReadLine(); // Aguardar Player 1 posicionar seus barcos
-            Console.WriteLine("Player 2, posicione seus barcos!");
-            PosicionarBarcos(boardPlayer2);
-            MostrarTabuleiro(boardPlayer2, "Tabuleiro do Player 2");
-            Console.WriteLine("Agora é a vez do Player 1!");
-            Console.ReadLine(); // Aguardar Player 1 posicionar seus barcos
-        }
-
-        // Jogo alternado
-        while (true)
-        {
-            if (playerId == "Player1")
+            // Se o arquivo existir, atribui Player 2
+            string existingPlayer = File.ReadAllText(filePath);
+            if (existingPlayer == "Player1")
             {
-                await JogarTurno(boardPlayer2, "Player 1", "Player 2");
+                player2Id = "Player2";
+                playerId = "Player2"; // O segundo jogador a se conectar será Player2
+                File.WriteAllText(filePath, playerId); // Atualiza o arquivo com Player2
+                Console.WriteLine("Você é o Player 2");
             }
             else
             {
-                await JogarTurno(boardPlayer1, "Player 2", "Player 1");
+                Console.WriteLine("O jogo já está em andamento.");
+                return;
             }
         }
+
+        // Envia o ID do jogador para o Service Bus
+        await EnviarMensagem(playerId);
+
+        // Espera pela resposta do outro jogador
+        string opponentId = await ReceberMensagem();
+
+        // Se o outro jogador já escolheu o ID, podemos continuar
+        if (opponentId != null && opponentId != playerId)
+        {
+            Console.WriteLine($"Jogador {opponentId} pronto. Iniciando jogo...");
+        }
+        else
+        {
+            Console.WriteLine("Esperando o adversário escolher o ID.");
+        }
+
+        InicializarTabuleiro(board);
+
+        if (playerId == "Player1")
+        {
+            minhaVez = true;
+            Console.WriteLine("Player 1, posicione seus barcos!");
+            PosicionarBarcos();
+            MostrarTabuleiro("Seu Tabuleiro");
+            await EnviarMensagem("READY");
+            Console.WriteLine("Aguardando o Player 2...");
+            while (await ReceberMensagem() != "READY") { }
+        }
+        else if (playerId == "Player2")
+        {
+            minhaVez = false;
+            Console.WriteLine("Aguardando o Player 1 posicionar os barcos...");
+            while (await ReceberMensagem() != "READY") { }
+            Console.WriteLine("Player 2, posicione seus barcos!");
+            PosicionarBarcos();
+            MostrarTabuleiro("Seu Tabuleiro");
+            await EnviarMensagem("READY");
+        }
+
+        while (!gameOver)
+        {
+            if (minhaVez)
+            {
+                await JogarTurno();
+                minhaVez = false;
+                await EnviarMensagem("TURN_END");
+            }
+            else
+            {
+                Console.WriteLine("Aguardando o adversário...");
+                string mensagem = await ReceberMensagem();
+                if (mensagem.StartsWith("ATAQUE"))
+                {
+                    ProcessarAtaque(mensagem.Substring(7));
+                    await EnviarMensagem("RESPONDER " + mensagem.Substring(7));
+                }
+                minhaVez = true;
+            }
+        }
+
+        Console.WriteLine("Jogo finalizado!");
     }
 
-    // Inicializa os tabuleiros com água
-    static void InicializarTabuleiro(string[,] board)
+    private static void InicializarTabuleiro(string[,] board)
     {
         for (int i = 0; i < 5; i++)
-        {
             for (int j = 0; j < 5; j++)
-            {
-                board[i, j] = "🌊"; // Água
-            }
-        }
+                board[i, j] = "🌊";
     }
 
-    // Permite que o jogador posicione seus barcos
-    static void PosicionarBarcos(string[,] board)
+    private static void PosicionarBarcos()
     {
         for (int i = 0; i < 3; i++)
         {
-            Console.WriteLine($"Posicionando o barco {i + 1}...");
+            Console.WriteLine($"Posicione o barco {i + 1}: ");
             int x, y;
             while (true)
             {
-                Console.WriteLine("Digite a posição do barco (ex: A1): ");
-                string input = Console.ReadLine().ToUpper(); // Tornar a entrada em maiúscula
+                Console.Write("Digite a posição (ex: A1): ");
+                string input = Console.ReadLine().ToUpper();
                 if (input.Length == 2 && input[0] >= 'A' && input[0] <= 'E' && input[1] >= '1' && input[1] <= '5')
                 {
-                    x = input[1] - '1'; // Converte o número da linha (1 a 5) para o índice
-                    y = input[0] - 'A'; // Converte a letra da coluna (A a E) para o índice
-
+                    x = input[1] - '1';
+                    y = input[0] - 'A';
                     if (board[x, y] == "🌊")
                     {
-                        board[x, y] = "🚢"; // Coloca o barco
+                        board[x, y] = "🚢";
                         break;
                     }
                     else
-                    {
-                        Console.WriteLine("Posição inválida ou já ocupada. Tente novamente.");
-                    }
+                        Console.WriteLine("Posição já ocupada. Tente outra.");
                 }
                 else
-                {
-                    Console.WriteLine("Formato inválido. Digite a posição no formato A1 a E5.");
-                }
+                    Console.WriteLine("Entrada inválida. Use A1 a E5.");
             }
         }
     }
 
-    // Mostra o tabuleiro do jogador
-    static void MostrarTabuleiro(string[,] board, string titulo)
+    private static void MostrarTabuleiro(string titulo)
     {
-        Console.WriteLine(titulo);
+        Console.WriteLine($"\n{titulo}");
         Console.WriteLine("  A   B   C   D   E");
         for (int i = 0; i < 5; i++)
         {
             Console.Write((i + 1) + " ");
             for (int j = 0; j < 5; j++)
-            {
                 Console.Write(board[i, j] + " ");
-            }
             Console.WriteLine();
         }
     }
 
-    // Realiza o turno de um jogador
-    static async Task JogarTurno(string[,] boardOponente, string jogadorAtacante, string jogadorDefensor)
+    private static async Task JogarTurno()
     {
         Console.Clear();
-        Console.WriteLine($"{jogadorAtacante} está atacando!");
-        MostrarTabuleiro(boardOponente, $"{jogadorDefensor} - Tabuleiro");
-
-        Console.WriteLine("\nDigite a posição do ataque (ex: A5): ");
+        MostrarTabuleiro("Seu Tabuleiro");
+        Console.WriteLine("Digite a posição do ataque (ex: A5): ");
         string ataque = Console.ReadLine().ToUpper();
-
-        await EnviarMensagem(ataque);
-        Console.WriteLine("Ataque enviado! 🎯 Aguardando resposta...");
-
-        // Aguarda o outro jogador para processar o ataque
-        await ReceberAtaque(boardOponente);
-
-        Console.WriteLine("\nPressione qualquer tecla para o próximo turno...");
-        Console.ReadLine();
+        await EnviarMensagem("ATAQUE " + ataque);
+        Console.WriteLine("Ataque enviado! Aguardando resposta...");
+        string resposta = await ReceberMensagem();
+        Console.WriteLine(resposta);  // Exibe a resposta de ACERTOU ou ERROU
     }
 
-    // Recebe o ataque e processa a resposta
-    static async Task ReceberAtaque(string[,] board)
+    private static void ProcessarAtaque(string ataque)
     {
-        Console.WriteLine("Aguardando ataque...");
+        int x = ataque[1] - '1';
+        int y = ataque[0] - 'A';
 
-        string ataque = await ReceberMensagem();
-        if (!string.IsNullOrEmpty(ataque))
+        if (board[x, y] == "🚢")
         {
-            // Aqui você já tem o código para processar as posições
-            if (ataque.Length == 2 && ataque[0] >= 'A' && ataque[0] <= 'E' && ataque[1] >= '1' && ataque[1] <= '5')
-            {
-                string pos = ataque.ToUpper(); // Converte para maiúsculas para garantir a consistência
-                int x = pos[1] - '1'; // Convertendo o número da linha
-                int y = pos[0] - 'A'; // Convertendo a letra da coluna
-
-                if (x >= 0 && x < 5 && y >= 0 && y < 5)
-                {
-                    if (board[x, y] == "🚢")
-                    {
-                        board[x, y] = "🔥"; // Acertou
-                        Console.WriteLine($"💥 Seu navio foi atingido em {pos}!");
-                    }
-                    else
-                    {
-                        board[x, y] = "❌"; // Errou
-                        Console.WriteLine($"💨 O ataque em {pos} errou!");
-                    }
-                }
-                else
-                {
-                    Console.WriteLine("Posição fora dos limites do tabuleiro!");
-                }
-            }
-            else
-            {
-                Console.WriteLine("Formato de ataque inválido! Tente novamente.");
-            }
+            board[x, y] = "💥";
+            Console.WriteLine("Fui atacado em " + ataque + "! Resultado: ACERTOU");
+            VerificarFimDeJogo();
+        }
+        else
+        {
+            board[x, y] = "❌";
+            Console.WriteLine("Fui atacado em " + ataque + "! Resultado: ERROU");
         }
     }
 
-    static async Task EnviarMensagem(string mensagem)
+    private static void VerificarFimDeJogo()
+    {
+        // Verificar se todos os barcos foram afundados
+        foreach (var cell in board)
+        {
+            if (cell == "🚢")
+                return;
+        }
+        gameOver = true;
+        Console.WriteLine("Todos os barcos foram afundados! Você venceu!");
+    }
+
+    private static async Task EnviarMensagem(string mensagem)
     {
         await using var client = new ServiceBusClient(connectionString);
         ServiceBusSender sender = client.CreateSender(queueName);
-
         ServiceBusMessage message = new ServiceBusMessage(Encoding.UTF8.GetBytes(mensagem));
         await sender.SendMessageAsync(message);
     }
 
-    static async Task<string> ReceberMensagem()
+    private static async Task<string> ReceberMensagem()
     {
         await using var client = new ServiceBusClient(connectionString);
         ServiceBusReceiver receiver = client.CreateReceiver(queueName);
-
         ServiceBusReceivedMessage message = await receiver.ReceiveMessageAsync();
         if (message != null)
         {
@@ -198,7 +223,6 @@ class Program
             await receiver.CompleteMessageAsync(message);
             return body;
         }
-
         return null;
     }
 }
